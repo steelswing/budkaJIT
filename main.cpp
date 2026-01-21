@@ -18,6 +18,7 @@ using namespace parser;
 #include <vector>
 #include <iostream>
 #include <iomanip>
+#include <cstring>
 
 struct JitContext {
     sljit_compiler* compiler;
@@ -134,6 +135,39 @@ struct JitContext {
     }
 };
 
+// Один элемент таблицы переходов
+
+struct V2PTable {
+    int32_t value; // Значение из case (например, 10, 100, 500)
+    int32_t bc_pos; // Абсолютный индекс в байт-коде (pc + offset)
+    void* jump_ptr; // Сюда JIT подставит адрес sljit_label
+};
+
+// Контейнер для таблицы
+
+struct SwitchTable {
+    int32_t count; // Количество элементов (npairs или high-low+1)
+    V2PTable table[]; // Flexible array member (C99)
+};
+
+SwitchTable* switchtable_create(int n) {
+    // Выделяем память под заголовок + массив из N элементов
+    size_t size = sizeof (SwitchTable) + (sizeof (V2PTable) * n);
+
+    SwitchTable* st = (SwitchTable*) malloc(size);
+    if (!st) return nullptr;
+
+    st->count = n;
+
+    // Обнуляем память для безопасности
+    memset(st->table, 0, sizeof (V2PTable) * n);
+
+    // В реальной JVM мы бы добавили st в список для последующего освобождения 
+    // вместе с методом (gc_register_jit_table(jit_context, st))
+
+    return st;
+}
+
 void genCode(sljit_compiler* compiler) {
     JavaClass clazz("D:\\BackupWinda\\Documents\\NetBeansProjects\\ButkaJitTest\\build\\classes\\Budka.class");
     JavaMethod method = findTestMethod(clazz);
@@ -145,14 +179,31 @@ void genCode(sljit_compiler* compiler) {
     }
 
     auto& bc = code_attr->code;
+    
     int max_locals = code_attr->maxLocals;
     int max_stack = code_attr->maxStack;
-    int frame = (max_locals + max_stack) * sizeof (sljit_sw);
 
-    sljit_emit_enter(compiler, 0, SLJIT_ARGS2(F64, W, W), 5 | SLJIT_ENTER_FLOAT(4), 2, frame);
+    // Для long значений нужно учитывать, что они занимают 2 слота
+    // Стек должен поддерживать как int (4 байта), так и long (8 байт)
+    int frame = (max_locals * 2 + max_stack * 2) * sizeof (sljit_sw);
 
-    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_MEM1(SLJIT_SP), 0 * sizeof (sljit_sw), SLJIT_S0, 0);
-    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_MEM1(SLJIT_SP), 1 * sizeof (sljit_sw), SLJIT_S1, 0);
+    // Возвращаем WORD (long), принимаем два 32-битных int
+    // SLJIT_ARGS2(W, 32, 32) означает: возврат Word, два аргумента по 32 бита
+    sljit_emit_enter(compiler, 0, SLJIT_ARGS2(W, 32, 32),
+            5 | SLJIT_ENTER_FLOAT(4), 2, frame);
+
+    // Сохраняем аргументы int n (S0) и int m (S1) в локальные переменные
+    // int занимает 4 байта, но для совместимости с long лучше использовать 8-байтовые слоты
+    sljit_emit_op1(compiler, SLJIT_MOV_S32,
+            SLJIT_MEM1(SLJIT_SP), 0 * sizeof (sljit_sw), SLJIT_S0, 0);
+    sljit_emit_op1(compiler, SLJIT_MOV_S32,
+            SLJIT_MEM1(SLJIT_SP), 1 * sizeof (sljit_sw), SLJIT_S1, 0);
+
+    //    sljit_emit_enter(compiler, 0, SLJIT_ARGS2(W, 32, 32), 5 | SLJIT_ENTER_FLOAT(4), 2, frame);
+    //    sljit_emit_enter(compiler, 0, SLJIT_ARGS2(F64, W, W), 5 | SLJIT_ENTER_FLOAT(4), 2, frame);
+
+    //    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_MEM1(SLJIT_SP), 0 * sizeof (sljit_s32), SLJIT_S0, 0);
+    //    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_MEM1(SLJIT_SP), 1 * sizeof (sljit_s32), SLJIT_S1, 0);
 
     JitContext ctx(compiler, max_locals, max_stack);
 
@@ -192,6 +243,8 @@ void genCode(sljit_compiler* compiler) {
 
             case JavaInstruction::IStore:
             case JavaInstruction::ILoad:
+            case JavaInstruction::LStore: // Добавьте это
+            case JavaInstruction::LLoad: // И это
             case JavaInstruction::DStore:
             case JavaInstruction::DLoad:
             case JavaInstruction::Ldc:
@@ -207,6 +260,83 @@ void genCode(sljit_compiler* compiler) {
                 pc += 3;
                 break;
             }
+            case JavaInstruction::TableSwitch:
+            {
+                // 1. Выравнивание (padding)
+                // Данные начинаются с адреса, кратного 4 относительно начала метода
+                int padding = (4 - (pc + 1) % 4) % 4;
+                int current_pos = pc + 1 + padding;
+
+                // Вспомогательная лямбда для чтения s32 из вектора байт-кода
+                auto get_s32_scan = [&](int offset) {
+                    return (int32_t) ((bc[offset] << 24) | (bc[offset + 1] << 16) |
+                            (bc[offset + 2] << 8) | bc[offset + 3]);
+                };
+
+                // 2. Читаем заголовок таблицы
+                int32_t default_offset = get_s32_scan(current_pos);
+                int32_t low = get_s32_scan(current_pos + 4);
+                int32_t high = get_s32_scan(current_pos + 8);
+                int32_t num_targets = high - low + 1;
+
+                // 3. Регистрируем метку для Default case
+                int default_target = pc + default_offset;
+                ctx.labels[default_target] = nullptr;
+                cout << "  TableSwitch at " << pc << " -> default target " << default_target << "\n";
+
+                // 4. Регистрируем метки для всех веток таблицы
+                int jump_table_base = current_pos + 12;
+                for (int i = 0; i < num_targets; i++) {
+                    int32_t offset = get_s32_scan(jump_table_base + i * 4);
+                    int target = pc + offset;
+                    ctx.labels[target] = nullptr;
+                    cout << "  TableSwitch at " << pc << " -> case target " << target << "\n";
+                }
+
+                // 5. КРИТИЧНО: Продвигаем PC на правильную длину всей инструкции
+                // 1 (opcode) + padding + 12 (def, low, high) + 4 * количество веток
+                pc = jump_table_base + (num_targets * 4);
+                break;
+            }
+            case JavaInstruction::LookupSwitch:
+            {
+                // 1. Выравнивание (padding) относительно начала метода
+                int padding = (4 - (pc + 1) % 4) % 4;
+                int current_pos = pc + 1 + padding;
+
+                // Лямбда для чтения s32 (Big Endian)
+                auto get_s32_scan = [&](int offset) {
+                    return (int32_t) ((bc[offset] << 24) | (bc[offset + 1] << 16) | (bc[offset + 2] << 8) | bc[offset + 3]);
+                };
+
+                // 2. Читаем default offset и количество пар npairs
+                int32_t default_offset = get_s32_scan(current_pos);
+                int32_t npairs = get_s32_scan(current_pos + 4);
+
+                // 3. Регистрируем метку для Default
+                int default_target = pc + default_offset;
+                if (ctx.labels.find(default_target) == ctx.labels.end()) {
+                    ctx.labels[default_target] = nullptr;
+                }
+
+                // 4. Проходим по всем парам и регистрируем их метки
+                // Каждая пара занимает 8 байт (4 байта ключ, 4 байта смещение)
+                int pairs_base = current_pos + 8;
+                for (int i = 0; i < npairs; i++) {
+                    // Смещение цели перехода находится во втором s32 каждой пары
+                    int32_t offset = get_s32_scan(pairs_base + i * 8 + 4);
+                    int target = pc + offset;
+                    if (ctx.labels.find(target) == ctx.labels.end()) {
+                        ctx.labels[target] = nullptr;
+                    }
+                }
+
+                // 5. Перепрыгиваем всю инструкцию
+                // 1 (opcode) + padding + 4 (default) + 4 (npairs) + 8 * npairs
+                pc = pairs_base + (npairs * 8);
+                break;
+            }
+
 
             default:
             {
@@ -236,6 +366,517 @@ void genCode(sljit_compiler* compiler) {
             case JavaInstruction::Nop:
             {
                 pc++;
+                break;
+            }
+
+            case JavaInstruction::TableSwitch:
+            {
+                int padding = (4 - (pc + 1) % 4) % 4;
+                int current_pos = pc + 1 + padding;
+
+                auto get_s32 = [&](int offset) {
+                    return (int32_t) ((bc[offset] << 24) | (bc[offset + 1] << 16) |
+                            (bc[offset + 2] << 8) | bc[offset + 3]);
+                };
+
+                int32_t default_offset = get_s32(current_pos);
+                int32_t low = get_s32(current_pos + 4);
+                int32_t high = get_s32(current_pos + 8);
+                int jump_table_base = current_pos + 12;
+                int32_t num_targets = high - low + 1;
+
+                // 1. Получаем значение из стека
+                ctx.popInt(SLJIT_R0, 0);
+
+                // 2. Проверка границ: if (val < low || val > high) goto default
+                auto jump_less = sljit_emit_cmp(compiler, SLJIT_SIG_LESS,
+                        SLJIT_R0, 0, SLJIT_IMM, low);
+                auto jump_greater = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER,
+                        SLJIT_R0, 0, SLJIT_IMM, high);
+
+                // 3. Нормализуем индекс: R0 = R0 - low
+                sljit_emit_op2(compiler, SLJIT_SUB, SLJIT_R0, 0,
+                        SLJIT_R0, 0, SLJIT_IMM, low);
+
+                // 4. Создаем таблицу адресов в runtime
+                // Выделяем память для таблицы меток (это нужно сделать ДО генерации кода)
+                std::vector<sljit_label*> case_labels(num_targets);
+
+                // 5. Генерируем код для каждого case и сохраняем метки
+                std::vector<sljit_jump*> case_jumps;
+                for (int i = 0; i < num_targets; i++) {
+                    // Проверяем: if (R0 == i) goto case_i
+                    auto j = sljit_emit_cmp(compiler, SLJIT_EQUAL,
+                            SLJIT_R0, 0, SLJIT_IMM, i);
+
+                    int32_t offset = get_s32(jump_table_base + i * 4);
+                    int target_pc = pc + offset;
+                    ctx.addPendingJump(j, target_pc);
+                }
+
+                // 6. Если ни один case не сработал, переходим к default
+                // (это дублирование проверки границ для безопасности)
+                auto jump_to_default = sljit_emit_jump(compiler, SLJIT_JUMP);
+                ctx.addPendingJump(jump_to_default, pc + default_offset);
+
+                // 7. Привязываем метки для out-of-bounds случаев
+                sljit_set_label(jump_less, sljit_emit_label(compiler));
+                sljit_set_label(jump_greater, sljit_emit_label(compiler));
+
+                // Оба прыгают на default
+                auto final_default_jump = sljit_emit_jump(compiler, SLJIT_JUMP);
+                ctx.addPendingJump(final_default_jump, pc + default_offset);
+
+                pc = jump_table_base + num_targets * 4;
+                break;
+            }
+
+                //            case JavaInstruction::TableSwitch:
+                //            {
+                //                // 1. Вычисление выравнивания (padding)
+                //                // По спецификации: (4 - (pc + 1) % 4) % 4 байт пропуска
+                //                int padding = (4 - (pc + 1) % 4) % 4;
+                //                int current_pos = pc + 1 + padding;
+                //
+                //                // 2. Чтение параметров из байт-кода
+                //                auto get_s32 = [&](int offset) {
+                //                    return (int32_t) ((bc[offset] << 24) | (bc[offset + 1] << 16) |
+                //                            (bc[offset + 2] << 8) | bc[offset + 3]);
+                //                };
+                //
+                //                int32_t default_offset = get_s32(current_pos);
+                //                int32_t low = get_s32(current_pos + 4);
+                //                int32_t high = get_s32(current_pos + 8);
+                //                int jump_table_base = current_pos + 12;
+                //
+                //                int32_t num_targets = high - low + 1;
+                //
+                //                // 3. Подготовка индекса (выталкиваем значение из стека Java)
+                //                ctx.popInt(SLJIT_R0, 0); // В R0 индекс для switch
+                //
+                //                // 4. Проверка границ: if (val < low || val > high) goto default
+                //                auto jump_less = sljit_emit_cmp(compiler, SLJIT_SIG_LESS, SLJIT_R0, 0, SLJIT_IMM, low);
+                //                auto jump_greater = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER, SLJIT_R0, 0, SLJIT_IMM, high);
+                //
+                //                // 5. Вычисление адреса перехода (Jump Table)
+                //                // Нормализуем индекс: R0 = R0 - low
+                //                sljit_emit_op2(compiler, SLJIT_SUB, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, low);
+                //
+                //                // В JIT режиме нам нужно прыгнуть на конкретные метки (labels), 
+                //                // которые соответствуют смещениям в байт-коде.
+                //                // Создаем массив прыжков для каждого кейса
+                //                for (int i = 0; i < num_targets; i++) {
+                //                    int32_t offset = get_s32(jump_table_base + i * 4);
+                //                    int target_pc = pc + offset;
+                //
+                //                    // Генерируем сравнение и прыжок для каждого элемента таблицы
+                //                    // Для оптимизации на больших таблицах лучше использовать массив адресов,
+                //                    // но в рамках sljit проще всего сделать серию проверок или indirect jump.
+                //                    auto j = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, i);
+                //                    ctx.addPendingJump(j, target_pc);
+                //                }
+                //
+                //                // 6. Обработка Default случая
+                //                // Если ни один кейс не сработал (хотя границы мы проверили выше, это для страховки)
+                //                // или если сработали границы jump_less/jump_greater
+                //                auto jump_default_final = sljit_emit_jump(compiler, SLJIT_JUMP);
+                //
+                //                sljit_set_label(jump_less, sljit_emit_label(compiler));
+                //                sljit_set_label(jump_greater, sljit_emit_label(compiler));
+                //
+                //                // Регистрируем прыжки в default
+                //                ctx.addPendingJump(jump_default_final, pc + default_offset);
+                //
+                //                // 7. Обновление PC
+                //                // Размер инструкции: 1 (опкод) + padding + 12 (def, low, high) + 4 * num_targets
+                //                pc = jump_table_base + num_targets * 4;
+                //                break;
+                //            }
+            case JavaInstruction::LookupSwitch:
+            {
+                // 1. Вычисление выравнивания (padding)
+                int padding = (4 - (pc + 1) % 4) % 4;
+                int current_pos = pc + 1 + padding;
+
+                auto get_s32 = [&](int offset) {
+                    return (int32_t) ((bc[offset] << 24) | (bc[offset + 1] << 16) |
+                            (bc[offset + 2] << 8) | bc[offset + 3]);
+                };
+
+                // 2. Чтение параметров
+                int32_t default_offset = get_s32(current_pos);
+                int32_t npairs = get_s32(current_pos + 4);
+                int pairs_base = current_pos + 8;
+
+                // 3. Получаем значение для сравнения из стека Java
+                ctx.popInt(SLJIT_R0, 0); // Искомое значение теперь в R0
+
+                // 4. Генерируем сравнение для каждой пары (key, offset)
+                for (int i = 0; i < npairs; i++) {
+                    int32_t key = get_s32(pairs_base + i * 8);
+                    int32_t offset = get_s32(pairs_base + i * 8 + 4);
+                    int target_pc = pc + offset;
+
+                    // Если R0 == key, прыгаем на target_pc
+                    auto jump_match = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, key);
+                    ctx.addPendingJump(jump_match, target_pc);
+                }
+
+                // 5. Если ни один ключ не подошел, выполняем прыжок по умолчанию (Default)
+                auto jump_default = sljit_emit_jump(compiler, SLJIT_JUMP);
+                ctx.addPendingJump(jump_default, pc + default_offset);
+
+                // 6. Обновление PC
+                // Размер: 1 (опкод) + padding + 4 (default) + 4 (npairs) + 8 * npairs
+                pc = pairs_base + (npairs * 8);
+                break;
+            }
+
+            case JavaInstruction::Dcmpl:
+            case JavaInstruction::Dcmpg:
+            {
+                bool is_dcmpg = (inst == JavaInstruction::Dcmpg);
+
+                ctx.popDouble(SLJIT_FR1, 0); // value2
+                ctx.popDouble(SLJIT_FR0, 0); // value1
+
+                // Если хотя бы одно число NaN, прыгаем на метку nan
+                auto jump_nan = sljit_emit_fcmp(compiler, SLJIT_UNORDERED, SLJIT_FR0, 0, SLJIT_FR1, 0);
+
+                // 2. Проверка на равенство (v1 == v2)
+                auto jump_equal = sljit_emit_fcmp(compiler, SLJIT_F_EQUAL, SLJIT_FR0, 0, SLJIT_FR1, 0);
+
+                // 3. Проверка v1 < v2
+                auto jump_less = sljit_emit_fcmp(compiler, SLJIT_F_LESS, SLJIT_FR0, 0, SLJIT_FR1, 0);
+
+                // --- Результат: Больше (v1 > v2) ---
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 1);
+                auto jump_end = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // --- Результат: Меньше (v1 < v2) ---
+                sljit_set_label(jump_less, sljit_emit_label(compiler));
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, -1);
+                auto jump_end2 = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // --- Результат: Равно (v1 == v2) ---
+                sljit_set_label(jump_equal, sljit_emit_label(compiler));
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                auto jump_end3 = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // --- Результат: NaN ---
+                sljit_set_label(jump_nan, sljit_emit_label(compiler));
+                // dcmpl возвращает -1 при NaN, dcmpg возвращает 1
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, is_dcmpg ? 1 : -1);
+
+                // Точка выхода для всех случаев
+                auto label_done = sljit_emit_label(compiler);
+                sljit_set_label(jump_end, label_done);
+                sljit_set_label(jump_end2, label_done);
+                sljit_set_label(jump_end3, label_done);
+
+                ctx.pushInt(SLJIT_R0, 0);
+                pc++;
+                break;
+            }
+
+            case JavaInstruction::Lcmp:
+            {
+                ctx.popLong(SLJIT_R1, 0); // value2
+                ctx.popLong(SLJIT_R0, 0); // value1
+
+                // Lcmp сравнивает два long ЗНАКОВО и возвращает:
+                // -1 если value1 < value2
+                //  0 если value1 == value2
+                //  1 если value1 > value2
+
+                // Сначала проверяем равенство
+                auto jump_equal = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_R1, 0);
+
+                // Затем проверяем меньше (ЗНАКОВОЕ!)
+                auto jump_less = sljit_emit_cmp(compiler, SLJIT_SIG_LESS, SLJIT_R0, 0, SLJIT_R1, 0);
+
+                // Если не равны и не меньше, значит больше
+                // Больше: возвращаем 1
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 1);
+                auto jump_end_greater = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // Меньше: возвращаем -1
+                sljit_set_label(jump_less, sljit_emit_label(compiler));
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, -1);
+                auto jump_end_less = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // Равны: возвращаем 0
+                sljit_set_label(jump_equal, sljit_emit_label(compiler));
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+                // Конец всех путей
+                auto label_end = sljit_emit_label(compiler);
+                sljit_set_label(jump_end_greater, label_end);
+                sljit_set_label(jump_end_less, label_end);
+
+                ctx.pushInt(SLJIT_R0, 0);
+                pc++;
+                break;
+            }
+
+            case JavaInstruction::Ifeq:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::Ifne:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::Iflt:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_LESS | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::Ifle:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::Ifgt:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::Ifge:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::If_icmpeq:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R1, 0);
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::If_icmpne:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R1, 0);
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::If_icmplt:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R1, 0);
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_LESS | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::If_icmpgt:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R1, 0);
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::If_icmple:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R1, 0);
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+            case JavaInstruction::If_icmpge:
+            {
+                if (pc + 2 >= bc.size()) {
+                    break;
+                }
+                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
+                int target = pc + off;
+                ctx.popInt(SLJIT_R1, 0);
+                ctx.popInt(SLJIT_R0, 0);
+                auto jump = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (jump) {
+                    ctx.addPendingJump(jump, target);
+                }
+                pc += 3;
+                break;
+            }
+
+
+
+
+
+
+            case JavaInstruction::LStore:
+{
+    if (pc + 1 >= bc.size()) break;
+    
+    int idx = bc[pc + 1];  // ВАЖНО: Это индекс СЛОТА, не байта!
+    
+    ctx.popLong(SLJIT_R0, 0);
+    ctx.storeLocalLong(idx, SLJIT_R0, 0);
+    
+    std::cout << "\t\tlstore #" << idx << "\n";
+    
+    pc += 2;
+    break;
+}
+
+case JavaInstruction::LLoad:
+{
+    if (pc + 1 >= bc.size()) break;
+    
+    int idx = bc[pc + 1];
+    
+    ctx.loadLocalLong(idx, SLJIT_R0, 0);
+    ctx.pushLong(SLJIT_R0, 0);
+    
+    std::cout << "\t\tlload #" << idx << "\n";
+    
+    pc += 2;
+    break;
+}
+
+
+
+ 
+
+            case JavaInstruction::ILoad:
+            {
+                if (pc + 1 >= bc.size()) {
+                    break;
+                }
+                int idx = bc[pc + 1];
+                ctx.loadLocalInt(idx, SLJIT_R0, 0);
+                ctx.pushInt(SLJIT_R0, 0);
+                pc += 2;
+                break;
+            }
+
+            case JavaInstruction::IStore:
+            {
+                if (pc + 1 >= bc.size()) {
+                    break;
+                }
+                int idx = bc[pc + 1];
+                ctx.popInt(SLJIT_R0, 0);
+                ctx.storeLocalInt(idx, SLJIT_R0, 0);
+                pc += 2;
                 break;
             }
 
@@ -461,17 +1102,6 @@ void genCode(sljit_compiler* compiler) {
                 break;
             }
 
-            case JavaInstruction::LLoad:
-            {
-                if (pc + 1 >= bc.size()) {
-                    break;
-                }
-                int idx = bc[pc + 1];
-                ctx.loadLocalLong(idx, SLJIT_R0, 0);
-                ctx.pushLong(SLJIT_R0, 0);
-                pc += 2;
-                break;
-            }
 
             case JavaInstruction::LLoad_0:
             case JavaInstruction::LLoad_1:
@@ -482,18 +1112,6 @@ void genCode(sljit_compiler* compiler) {
                 ctx.loadLocalLong(idx, SLJIT_R0, 0);
                 ctx.pushLong(SLJIT_R0, 0);
                 pc++;
-                break;
-            }
-
-            case JavaInstruction::LStore:
-            {
-                if (pc + 1 >= bc.size()) {
-                    break;
-                }
-                int idx = bc[pc + 1];
-                ctx.popLong(SLJIT_R0, 0);
-                ctx.storeLocalLong(idx, SLJIT_R0, 0);
-                pc += 2;
                 break;
             }
 
@@ -509,17 +1127,6 @@ void genCode(sljit_compiler* compiler) {
                 break;
             }
 
-            case JavaInstruction::ILoad:
-            {
-                if (pc + 1 >= bc.size()) {
-                    break;
-                }
-                int idx = bc[pc + 1];
-                ctx.loadLocalInt(idx, SLJIT_R0, 0);
-                ctx.pushInt(SLJIT_R0, 0);
-                pc += 2;
-                break;
-            }
 
             case JavaInstruction::ILoad_0:
             case JavaInstruction::ILoad_1:
@@ -530,18 +1137,6 @@ void genCode(sljit_compiler* compiler) {
                 ctx.loadLocalInt(idx, SLJIT_R0, 0);
                 ctx.pushInt(SLJIT_R0, 0);
                 pc++;
-                break;
-            }
-
-            case JavaInstruction::IStore:
-            {
-                if (pc + 1 >= bc.size()) {
-                    break;
-                }
-                int idx = bc[pc + 1];
-                ctx.popInt(SLJIT_R0, 0);
-                ctx.storeLocalInt(idx, SLJIT_R0, 0);
-                pc += 2;
                 break;
             }
 
@@ -598,14 +1193,47 @@ void genCode(sljit_compiler* compiler) {
             }
 
             case JavaInstruction::Lrem:
-            {
-                ctx.popLong(SLJIT_R1, 0);
-                ctx.popLong(SLJIT_R0, 0);
-                sljit_emit_op0(compiler, SLJIT_DIVMOD_SW);
-                ctx.pushLong(SLJIT_R1, 0);
-                pc++;
-                break;
-            }
+{
+    ctx.popLong(SLJIT_R1, 0);  // делитель
+    ctx.popLong(SLJIT_R0, 0);  // делимое
+
+    // КРИТИЧНО: Проверка на 0
+    auto jump_zero = sljit_emit_cmp(compiler, SLJIT_EQUAL, 
+                                     SLJIT_R1, 0, SLJIT_IMM, 0);
+    
+    // КРИТИЧНО: Проверка на INT64_MIN / -1 (overflow!)
+    sljit_emit_op2(compiler, SLJIT_XOR, SLJIT_R2, 0, 
+                   SLJIT_R1, 0, SLJIT_IMM, -1);
+    auto jump_neg1 = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, 
+                                     SLJIT_R2, 0, SLJIT_IMM, 0);
+    
+    sljit_emit_op2(compiler, SLJIT_XOR, SLJIT_R2, 0, 
+                   SLJIT_R0, 0, SLJIT_IMM, INT64_MIN);
+    auto jump_not_min = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, 
+                                        SLJIT_R2, 0, SLJIT_IMM, 0);
+    
+    // Если R0 == INT64_MIN и R1 == -1, результат = 0
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
+    auto jump_end_overflow = sljit_emit_jump(compiler, SLJIT_JUMP);
+    
+    // Нормальный случай
+    sljit_set_label(jump_neg1, sljit_emit_label(compiler));
+    sljit_set_label(jump_not_min, sljit_emit_label(compiler));
+    
+    sljit_emit_op0(compiler, SLJIT_DIVMOD_SW);
+    auto jump_end = sljit_emit_jump(compiler, SLJIT_JUMP);
+    
+    // Деление на 0
+    sljit_set_label(jump_zero, sljit_emit_label(compiler));
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
+    
+    sljit_set_label(jump_end, sljit_emit_label(compiler));
+    sljit_set_label(jump_end_overflow, sljit_emit_label(compiler));
+    
+    ctx.pushLong(SLJIT_R1, 0);
+    pc++;
+    break;
+}
 
             case JavaInstruction::Iadd:
             {
@@ -649,10 +1277,23 @@ void genCode(sljit_compiler* compiler) {
 
             case JavaInstruction::Irem:
             {
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
+                ctx.popInt(SLJIT_R1, 0); // делитель
+                ctx.popInt(SLJIT_R0, 0); // делимое
+
+                // КРИТИЧНО: Проверяем деление на 0
+                auto jump_zero = sljit_emit_cmp(compiler, SLJIT_EQUAL,SLJIT_R1, 0, SLJIT_IMM, 0);
+
+                // Нормальный случай
                 sljit_emit_op0(compiler, SLJIT_DIVMOD_S32);
-                ctx.pushInt(SLJIT_R1, 0);
+                auto jump_end = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // Деление на 0: Java бросает ArithmeticException
+                // Для простоты возвращаем 0 или вызываем abort
+                sljit_set_label(jump_zero, sljit_emit_label(compiler));
+                sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, 0);
+
+                sljit_set_label(jump_end, sljit_emit_label(compiler));
+                ctx.pushInt(SLJIT_R1, 0); // остаток в R1
                 pc++;
                 break;
             }
@@ -973,200 +1614,6 @@ void genCode(sljit_compiler* compiler) {
                 pc++;
                 break;
             }
-
-            case JavaInstruction::Lcmp:
-            {
-                ctx.popLong(SLJIT_R1, 0);
-                ctx.popLong(SLJIT_R0, 0);
-
-                auto label_less = sljit_emit_label(compiler);
-                auto jump_less = sljit_emit_cmp(compiler, SLJIT_LESS, SLJIT_R0, 0, SLJIT_R1, 0);
-                auto jump_greater = sljit_emit_cmp(compiler, SLJIT_GREATER, SLJIT_R0, 0, SLJIT_R1, 0);
-
-                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 0);
-                auto jump_end1 = sljit_emit_jump(compiler, SLJIT_JUMP);
-
-                sljit_set_label(jump_less, sljit_emit_label(compiler));
-                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, -1);
-                auto jump_end2 = sljit_emit_jump(compiler, SLJIT_JUMP);
-
-                sljit_set_label(jump_greater, sljit_emit_label(compiler));
-                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 1);
-
-                auto label_end = sljit_emit_label(compiler);
-                sljit_set_label(jump_end1, label_end);
-                sljit_set_label(jump_end2, label_end);
-
-                ctx.pushInt(SLJIT_R0, 0);
-                pc++;
-                break;
-            }
-
-            case JavaInstruction::Ifeq:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::Iflt:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_LESS | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::Ifle:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_LESS_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::Ifgt:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_GREATER | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::Ifge:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::If_icmpeq:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::If_icmpne:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::If_icmplt:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_LESS | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::If_icmpgt:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_GREATER | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
-            case JavaInstruction::If_icmple:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_LESS_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                }
-                pc += 3;
-                break;
-            }
-
             case JavaInstruction::Pop:
             {
                 ctx.stackPtr--;
@@ -1392,23 +1839,6 @@ void genCode(sljit_compiler* compiler) {
                 break;
             }
 
-            case JavaInstruction::Ifne:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                } else {
-                    cerr << "ERROR: Failed to create jump at pc " << pc << "\n";
-                }
-                pc += 3;
-                break;
-            }
 
             case JavaInstruction::Ldc2_w:
             {
@@ -1544,25 +1974,6 @@ void genCode(sljit_compiler* compiler) {
                 break;
             }
 
-            case JavaInstruction::If_icmpge:
-            {
-                if (pc + 2 >= bc.size()) {
-                    break;
-                }
-                int16_t off = (int16_t) ((bc[pc + 1] << 8) | bc[pc + 2]);
-                int target = pc + off;
-                ctx.popInt(SLJIT_R1, 0);
-                ctx.popInt(SLJIT_R0, 0);
-                auto jump = sljit_emit_cmp(compiler, SLJIT_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_R1, 0);
-                if (jump) {
-                    ctx.addPendingJump(jump, target);
-                } else {
-                    cerr << "ERROR: Failed to create jump at pc " << pc << "\n";
-                }
-                pc += 3;
-                break;
-            }
-
             case JavaInstruction::Goto:
             {
                 if (pc + 2 >= bc.size()) {
@@ -1604,7 +2015,8 @@ void genCode(sljit_compiler* compiler) {
 }
 
 
-typedef double(*func2_t)(sljit_sw a, sljit_sw b);
+//typedef double(*func2_t)(sljit_sw a, sljit_sw b);
+typedef int64_t(*func2_t)(int32_t a, int32_t b);
 
 int64_t source(int32_t n, int32_t m) {
     return (n * 2) << 2;
@@ -1631,11 +2043,11 @@ int main(int argc, char** argv) {
     dump_code_to_file(code, code_size, "jit_code.bin");
     func = (func2_t) code;
     printf("\n=== Тестирование функции ===\n");
-    std::cout << "Result: " << std::to_string(func(1'000'000, 8)) << " source: " << std::to_string(source(4, 8)) << std::endl;
-    for (int i = 0; i <= 3; i++) {
+    std::cout << "Result: " << std::to_string(func(1'000'000, 4)) << " source: " << std::to_string(source(4, 8)) << std::endl;
+    for (int i = 0; i <= 5; i++) {
         auto start = std::chrono::high_resolution_clock::now();
-        double result = 0.0;
-        for (int j = 0; j < 100; j++) {
+        int64_t result = 0;
+        for (int j = 0; j < 1; j++) {
             result = func(1'000'000, i);
         }
         auto end = std::chrono::high_resolution_clock::now();
@@ -1644,11 +2056,12 @@ int main(int argc, char** argv) {
         auto durationMillis = durationNanos / 1'000'000;
         double durationSeconds = durationNanos / 1'000'000'000.0;
         std::cout << "\n=====================================\n";
-        std::cout << std::fixed << std::setprecision(17) << "Result: " << result << "\n";
-        std::cout << "Seconds: " << durationSeconds << "\n";
-        std::cout << "Millis: " << durationMillis << "\n";
-        std::cout << "Micros: " << durationMicros << "\n";
-        std::cout << "Nanos: " << durationNanos << "\n";
+        std::cout << "Result: " << std::to_string(result) << "\n";
+        //        std::cout << std::fixed << std::setprecision(17) << "Result: " << result << "\n";
+        std::cout << "\tSeconds: " << durationSeconds << "\n";
+        std::cout << "\tMillis: " << durationMillis << "\n";
+        std::cout << "\tMicros: " << durationMicros << "\n";
+        std::cout << "\tNanos: " << durationNanos << "\n";
     }
     sljit_free_code(code, NULL);
     return 0;
