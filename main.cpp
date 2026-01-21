@@ -179,7 +179,7 @@ void genCode(sljit_compiler* compiler) {
     }
 
     auto& bc = code_attr->code;
-    
+
     int max_locals = code_attr->maxLocals;
     int max_stack = code_attr->maxStack;
 
@@ -430,68 +430,6 @@ void genCode(sljit_compiler* compiler) {
                 pc = jump_table_base + num_targets * 4;
                 break;
             }
-
-                //            case JavaInstruction::TableSwitch:
-                //            {
-                //                // 1. Вычисление выравнивания (padding)
-                //                // По спецификации: (4 - (pc + 1) % 4) % 4 байт пропуска
-                //                int padding = (4 - (pc + 1) % 4) % 4;
-                //                int current_pos = pc + 1 + padding;
-                //
-                //                // 2. Чтение параметров из байт-кода
-                //                auto get_s32 = [&](int offset) {
-                //                    return (int32_t) ((bc[offset] << 24) | (bc[offset + 1] << 16) |
-                //                            (bc[offset + 2] << 8) | bc[offset + 3]);
-                //                };
-                //
-                //                int32_t default_offset = get_s32(current_pos);
-                //                int32_t low = get_s32(current_pos + 4);
-                //                int32_t high = get_s32(current_pos + 8);
-                //                int jump_table_base = current_pos + 12;
-                //
-                //                int32_t num_targets = high - low + 1;
-                //
-                //                // 3. Подготовка индекса (выталкиваем значение из стека Java)
-                //                ctx.popInt(SLJIT_R0, 0); // В R0 индекс для switch
-                //
-                //                // 4. Проверка границ: if (val < low || val > high) goto default
-                //                auto jump_less = sljit_emit_cmp(compiler, SLJIT_SIG_LESS, SLJIT_R0, 0, SLJIT_IMM, low);
-                //                auto jump_greater = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER, SLJIT_R0, 0, SLJIT_IMM, high);
-                //
-                //                // 5. Вычисление адреса перехода (Jump Table)
-                //                // Нормализуем индекс: R0 = R0 - low
-                //                sljit_emit_op2(compiler, SLJIT_SUB, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, low);
-                //
-                //                // В JIT режиме нам нужно прыгнуть на конкретные метки (labels), 
-                //                // которые соответствуют смещениям в байт-коде.
-                //                // Создаем массив прыжков для каждого кейса
-                //                for (int i = 0; i < num_targets; i++) {
-                //                    int32_t offset = get_s32(jump_table_base + i * 4);
-                //                    int target_pc = pc + offset;
-                //
-                //                    // Генерируем сравнение и прыжок для каждого элемента таблицы
-                //                    // Для оптимизации на больших таблицах лучше использовать массив адресов,
-                //                    // но в рамках sljit проще всего сделать серию проверок или indirect jump.
-                //                    auto j = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, i);
-                //                    ctx.addPendingJump(j, target_pc);
-                //                }
-                //
-                //                // 6. Обработка Default случая
-                //                // Если ни один кейс не сработал (хотя границы мы проверили выше, это для страховки)
-                //                // или если сработали границы jump_less/jump_greater
-                //                auto jump_default_final = sljit_emit_jump(compiler, SLJIT_JUMP);
-                //
-                //                sljit_set_label(jump_less, sljit_emit_label(compiler));
-                //                sljit_set_label(jump_greater, sljit_emit_label(compiler));
-                //
-                //                // Регистрируем прыжки в default
-                //                ctx.addPendingJump(jump_default_final, pc + default_offset);
-                //
-                //                // 7. Обновление PC
-                //                // Размер инструкции: 1 (опкод) + padding + 12 (def, low, high) + 4 * num_targets
-                //                pc = jump_table_base + num_targets * 4;
-                //                break;
-                //            }
             case JavaInstruction::LookupSwitch:
             {
                 // 1. Вычисление выравнивания (padding)
@@ -819,42 +757,39 @@ void genCode(sljit_compiler* compiler) {
 
 
 
-
-
-
             case JavaInstruction::LStore:
-{
-    if (pc + 1 >= bc.size()) break;
-    
-    int idx = bc[pc + 1];  // ВАЖНО: Это индекс СЛОТА, не байта!
-    
-    ctx.popLong(SLJIT_R0, 0);
-    ctx.storeLocalLong(idx, SLJIT_R0, 0);
-    
-    std::cout << "\t\tlstore #" << idx << "\n";
-    
-    pc += 2;
-    break;
-}
+            {
+                if (pc + 1 >= bc.size()) break;
 
-case JavaInstruction::LLoad:
-{
-    if (pc + 1 >= bc.size()) break;
-    
-    int idx = bc[pc + 1];
-    
-    ctx.loadLocalLong(idx, SLJIT_R0, 0);
-    ctx.pushLong(SLJIT_R0, 0);
-    
-    std::cout << "\t\tlload #" << idx << "\n";
-    
-    pc += 2;
-    break;
-}
+                int idx = bc[pc + 1]; // ВАЖНО: Это индекс СЛОТА, не байта!
+
+                ctx.popLong(SLJIT_R0, 0);
+                ctx.storeLocalLong(idx, SLJIT_R0, 0);
+
+                std::cout << "\t\tlstore #" << idx << "\n";
+
+                pc += 2;
+                break;
+            }
+
+            case JavaInstruction::LLoad:
+            {
+                if (pc + 1 >= bc.size()) break;
+
+                int idx = bc[pc + 1];
+
+                ctx.loadLocalLong(idx, SLJIT_R0, 0);
+                ctx.pushLong(SLJIT_R0, 0);
+
+                std::cout << "\t\tlload #" << idx << "\n";
+
+                pc += 2;
+                break;
+            }
 
 
 
- 
+
 
             case JavaInstruction::ILoad:
             {
@@ -1193,47 +1128,47 @@ case JavaInstruction::LLoad:
             }
 
             case JavaInstruction::Lrem:
-{
-    ctx.popLong(SLJIT_R1, 0);  // делитель
-    ctx.popLong(SLJIT_R0, 0);  // делимое
+            {
+                ctx.popLong(SLJIT_R1, 0); // делитель
+                ctx.popLong(SLJIT_R0, 0); // делимое
 
-    // КРИТИЧНО: Проверка на 0
-    auto jump_zero = sljit_emit_cmp(compiler, SLJIT_EQUAL, 
-                                     SLJIT_R1, 0, SLJIT_IMM, 0);
-    
-    // КРИТИЧНО: Проверка на INT64_MIN / -1 (overflow!)
-    sljit_emit_op2(compiler, SLJIT_XOR, SLJIT_R2, 0, 
-                   SLJIT_R1, 0, SLJIT_IMM, -1);
-    auto jump_neg1 = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, 
-                                     SLJIT_R2, 0, SLJIT_IMM, 0);
-    
-    sljit_emit_op2(compiler, SLJIT_XOR, SLJIT_R2, 0, 
-                   SLJIT_R0, 0, SLJIT_IMM, INT64_MIN);
-    auto jump_not_min = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, 
-                                        SLJIT_R2, 0, SLJIT_IMM, 0);
-    
-    // Если R0 == INT64_MIN и R1 == -1, результат = 0
-    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
-    auto jump_end_overflow = sljit_emit_jump(compiler, SLJIT_JUMP);
-    
-    // Нормальный случай
-    sljit_set_label(jump_neg1, sljit_emit_label(compiler));
-    sljit_set_label(jump_not_min, sljit_emit_label(compiler));
-    
-    sljit_emit_op0(compiler, SLJIT_DIVMOD_SW);
-    auto jump_end = sljit_emit_jump(compiler, SLJIT_JUMP);
-    
-    // Деление на 0
-    sljit_set_label(jump_zero, sljit_emit_label(compiler));
-    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
-    
-    sljit_set_label(jump_end, sljit_emit_label(compiler));
-    sljit_set_label(jump_end_overflow, sljit_emit_label(compiler));
-    
-    ctx.pushLong(SLJIT_R1, 0);
-    pc++;
-    break;
-}
+                // КРИТИЧНО: Проверка на 0
+                auto jump_zero = sljit_emit_cmp(compiler, SLJIT_EQUAL,
+                        SLJIT_R1, 0, SLJIT_IMM, 0);
+
+                // КРИТИЧНО: Проверка на INT64_MIN / -1 (overflow!)
+                sljit_emit_op2(compiler, SLJIT_XOR, SLJIT_R2, 0,
+                        SLJIT_R1, 0, SLJIT_IMM, -1);
+                auto jump_neg1 = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL,
+                        SLJIT_R2, 0, SLJIT_IMM, 0);
+
+                sljit_emit_op2(compiler, SLJIT_XOR, SLJIT_R2, 0,
+                        SLJIT_R0, 0, SLJIT_IMM, INT64_MIN);
+                auto jump_not_min = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL,
+                        SLJIT_R2, 0, SLJIT_IMM, 0);
+
+                // Если R0 == INT64_MIN и R1 == -1, результат = 0
+                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
+                auto jump_end_overflow = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // Нормальный случай
+                sljit_set_label(jump_neg1, sljit_emit_label(compiler));
+                sljit_set_label(jump_not_min, sljit_emit_label(compiler));
+
+                sljit_emit_op0(compiler, SLJIT_DIVMOD_SW);
+                auto jump_end = sljit_emit_jump(compiler, SLJIT_JUMP);
+
+                // Деление на 0
+                sljit_set_label(jump_zero, sljit_emit_label(compiler));
+                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
+
+                sljit_set_label(jump_end, sljit_emit_label(compiler));
+                sljit_set_label(jump_end_overflow, sljit_emit_label(compiler));
+
+                ctx.pushLong(SLJIT_R1, 0);
+                pc++;
+                break;
+            }
 
             case JavaInstruction::Iadd:
             {
@@ -1281,7 +1216,7 @@ case JavaInstruction::LLoad:
                 ctx.popInt(SLJIT_R0, 0); // делимое
 
                 // КРИТИЧНО: Проверяем деление на 0
-                auto jump_zero = sljit_emit_cmp(compiler, SLJIT_EQUAL,SLJIT_R1, 0, SLJIT_IMM, 0);
+                auto jump_zero = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 0);
 
                 // Нормальный случай
                 sljit_emit_op0(compiler, SLJIT_DIVMOD_S32);
